@@ -27,8 +27,8 @@ from ultralytics import YOLO
 
 # ===================== CONFIG FONTE =====================
 # Use duas câmeras IP, ou a mesma para teste (defina CAM_B_URL = CAM_A_URL), ou webcams 0/1.
-CAM_A_URL = "video2.mp4" #rtsp://admin:Naoesquecer1@192.168.100.28:554/cam/realmonitor?channel=1&subtype=1"
-CAM_B_URL = "video.mp4" #"rtsp://admin:Naoesquecer1@192.168.100.7:554/cam/realmonitor?channel=1&subtype=1"
+CAM_A_URL = "rtsp://admin:QT9RJ462@192.168.0.108:554/cam/realmonitor?channel=1&subtype=1"
+CAM_B_URL = 0 #"rtsp://admin:Naoesquecer1@192.168.100.7:554/cam/realmonitor?channel=1&subtype=1"
 # CAM_A_URL, CAM_B_URL = 0, 1         # exemplo com duas webcams
 # CAM_B_URL = CAM_A_URL               # para testar com uma única fonte
 
