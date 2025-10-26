@@ -2,20 +2,28 @@
 ped_crosswalk_tag.py
 Sistema de faixa de pedestres com:
 - YOLOv8 (apenas pessoas) e ROI desenhável da faixa
-- Simulador de TAG (teclado 't'/'1'..'9', botão na tela, arquivo tag.trigger)
+- Integração por CABO com ESP32 (RFID RC522 + BOTÃO físico):
+    * PC → ESP: OUT,<b0..b4>  (veh_g,veh_y,veh_r,ped_w,ped_dw)
+    * PC → ESP: PING          (ESP responde PONG)
+    * ESP → PC: TAG,<uidhex>  (cartão lido)
+    * ESP → PC: BTN,PED       (botão físico pressionado)
+    * ESP → PC: HB            (heartbeat 1s)
+- Simulador de TAG local (teclado 't'/'1'..'9', botão na tela, arquivo tag.trigger)
 - FSM:
     VEH_GREEN → VEH_YEL → ALL_RED_TO_PED → PED_GREEN → ALL_RED_TO_VEH → VEH_GREEN
-- TAG apenas acelera o fim do VEH_GREEN (pré-empção)
+- TAG/BOTÃO apenas aceleram o fim do VEH_GREEN (pré-empção)
 - PED_GREEN: bônus inicial se já houver pessoa e EXTENSÃO contínua enquanto houver pessoa
-- HUD mostra estados de CARROS, PEDESTRE e “Pessoa na faixa: SIM/NAO”
-- Modo --fast: descarta frames RTSP e faz inferência em resolução reduzida
+- HUD mostra estados e “Pessoa na faixa: SIM/NAO”
+- CLI webcam: --480p / --720p / --1080p / --width/--height/--fps
+- Modo --fast: descarta frames antigos e faz inferência em frame reduzido
 
 Instalação:
-    pip install ultralytics opencv-python numpy
+    pip install ultralytics opencv-python numpy pyserial
 
 Como rodar:
     python ped_crosswalk_tag.py
     python ped_crosswalk_tag.py --fast
+    python ped_crosswalk_tag.py --720p
     python ped_crosswalk_tag.py reset   # apaga ROI e redesenha
 
 Controles:
@@ -26,7 +34,7 @@ Controles:
     touch tag.trigger -> dispara uma vez (crie o arquivo vazio na pasta)
 """
 
-import sys, os, time, json
+import sys, os, time, json, argparse
 from enum import Enum
 from typing import List, Tuple
 
@@ -34,12 +42,15 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ===================== CONFIG BÁSICA =====================
-YOLO_MODEL_PATH = "yolo11s.pt"
+# Serial / threading
+import serial, serial.tools.list_ports
+import threading, queue
 
-# Fonte de vídeo (RTSP da câmera) OU Webcam:
-#CAMERA_URL = "rtsp://admin:QT9RJ462@192.168.0.108:554/cam/realmonitor?channel=1&subtype=1"
-CAMERA_URL = 1  # descomente para usar webcam
+# ===================== CONFIG BÁSICA =====================
+YOLO_MODEL_PATH = "yolov8n.pt"
+
+# Fonte de vídeo: WEBCAM por padrão
+CAMERA_URL = 1  # use 0 / 1 / 2... para webcams
 
 ROI_JSON = "roi_pedestre.json"
 
@@ -53,7 +64,7 @@ C_ROI    = (255, 0, 255)
 
 MAIN_WIN = "Faixa Pedestre + TAG"
 
-# ===================== Simulador de TAG =====================
+# ===================== Simulador de TAG (local) =====================
 class TagSimulator:
     TAG_BUTTON_RECT = (20, 120, 180, 170)
     FILE_TRIGGER = "tag.trigger"
@@ -100,7 +111,6 @@ class TagSimulator:
 
     def draw_button(self, frame):
         x1,y1,x2,y2 = self.TAG_BUTTON_RECT
-        # desenha somente a área do botão para economizar CPU
         overlay = frame.copy()
         cv2.rectangle(overlay,(x1,y1),(x2,y2),(60,200,60),-1)
         roi = frame[y1:y2, x1:x2]
@@ -127,14 +137,14 @@ PED_EXT_STEP=5             # extensão por detecção contínua
 PEDESTRIAN_CLEAR_GRACE=5   # faixa livre por Xs para encerrar pedestre
 PED_ENTRY_BOOST=5          # bônus inicial se já houver pessoa ao abrir pedestre
 
-# Preempção por TAG (acelera fechamento do verde dos carros)
+# Preempção por TAG/BOTÃO (acelera fechamento do verde dos carros)
 MIN_GREEN_BEFORE_PREEMPT=5
 PREEMPT_CUT_TO=5
 
 class TrafficLightFSM:
     """
     Ciclo: VEH_GREEN → VEH_YEL → ALL_RED_TO_PED → PED_GREEN → ALL_RED_TO_VEH → VEH_GREEN
-    - TAG em VEH_GREEN só antecipa a ida ao VEH_YEL (preempção).
+    - TAG/BOTÃO em VEH_GREEN só antecipa a ida ao VEH_YEL (preempção).
     - Em PED_GREEN, o tempo é estendido enquanto houver pessoa NA FAIXA.
     """
     def __init__(self):
@@ -160,7 +170,7 @@ class TrafficLightFSM:
     def update(self,pessoa_na_faixa:bool):
         now=time.monotonic()
 
-        # TAG durante VERDE carros => corta p/ amarelo (sem consumir tag aqui)
+        # Pré-empção durante VERDE carros => corta p/ amarelo
         if self.state==State.VEH_GREEN and self.tag_pending:
             if self._elapsed()>=MIN_GREEN_BEFORE_PREEMPT:
                 self.state=State.VEH_YEL
@@ -178,17 +188,15 @@ class TrafficLightFSM:
             if self._elapsed()>=self.tgt:
                 self.state=State.ALL_RED_TO_PED; self._reset(ALL_RED_CLEAR)
 
-        # ALL RED → preparar para abrir pedestre (pedestre AINDA FECHADO AQUI)
+        # ALL RED → preparar para abrir pedestre (pedestre FECHADO aqui)
         elif self.state==State.ALL_RED_TO_PED:
-            self._outs(False,False,True,False,True)  # all-red total
+            self._outs(False,False,True,False,True)
             if self._elapsed()>=self.tgt:
                 self.state=State.PED_GREEN
-                # bônus se já houver pessoa agora
                 extra = PED_ENTRY_BOOST if pessoa_na_faixa else 0
                 self._reset(PED_GREEN_BASE + extra)
-                # inicia/zera marcador de presença
                 self.last_seen_person_ts = now if pessoa_na_faixa else None
-                self.tag_pending=False  # consome tag (se veio)
+                self.tag_pending=False  # consome tag/botão
 
         # PED GREEN (estende enquanto houver pessoa)
         elif self.state==State.PED_GREEN:
@@ -197,12 +205,10 @@ class TrafficLightFSM:
                 self.last_seen_person_ts = now
             base_done = self._elapsed() >= self.tgt
             nobody_recent = (self.last_seen_person_ts is None) or ((now - self.last_seen_person_ts) >= PEDESTRIAN_CLEAR_GRACE)
-
             if base_done:
                 if nobody_recent:
                     self.state=State.ALL_RED_TO_VEH; self._reset(ALL_RED_CLEAR)
                 else:
-                    # Estende adicionando segundos ao alvo atual (em vez de resetar com remaining())
                     self.tgt += PED_EXT_STEP
 
         # ALL RED → voltar carros
@@ -214,7 +220,7 @@ class TrafficLightFSM:
                 self.last_seen_person_ts=None
         return self.state
 
-    # HUD à direita (inclui “Pessoa na faixa”)
+    # HUD
     @staticmethod
     def _put_right(frame,text,y,scale=0.9,color=(255,255,255),th=2):
         (w,_),_ = cv2.getTextSize(text,cv2.FONT_HERSHEY_SIMPLEX,scale,th)
@@ -274,29 +280,157 @@ def mouse_cb(ev,x,y,flags,param):
         if ev==cv2.EVENT_LBUTTONDOWN and tag_sim is not None:
             tag_sim.click(x,y)
 
+# ===================== SERIAL COM ESP32 =====================
+SER_PORT = "COM3"  # ex.: "COM5" (Windows) ou "/dev/ttyUSB0" (Linux)
+SER_BAUD = 115200
+
+ser = None
+rx_q = queue.Queue()
+
+def find_esp_port():
+    for p in serial.tools.list_ports.comports():
+        name = (p.device or "") + " " + (p.description or "")
+        if any(k in name.upper() for k in ["USB", "CP210", "CH340", "FTDI", "SILABS"]):
+            return p.device
+    return None
+
+def serial_reader():
+    global ser
+    buf = b""
+    while ser and ser.is_open:
+        try:
+            b = ser.read(1)
+            if not b:
+                continue
+            if b in (b'\n', b'\r'):
+                if buf:
+                    line = buf.decode(errors="ignore").strip()
+                    rx_q.put(line)
+                    buf = b""
+            else:
+                buf += b
+                if len(buf) > 256:
+                    buf = b""
+        except Exception:
+            break
+
+def serial_init():
+    global ser, SER_PORT
+    if SER_PORT is None:
+        SER_PORT = find_esp_port() or ("COM5" if os.name == "nt" else "/dev/ttyUSB0")
+    try:
+        ser = serial.Serial(SER_PORT, SER_BAUD, timeout=0.01)
+        th = threading.Thread(target=serial_reader, daemon=True)
+        th.start()
+        print(f"[SER] conectado em {SER_PORT}")
+        return True
+    except Exception as e:
+        print(f"[SER] falha ao abrir {SER_PORT}: {e}")
+        return False
+
+def ser_send(line: str):
+    if ser and ser.is_open:
+        try:
+            ser.write((line.strip() + "\n").encode())
+        except Exception as e:
+            print("[SER] erro envio:", e)
+
+def outputs_to_bits(outs: dict) -> str:
+    # Ordem: veh_g, veh_y, veh_r, ped_w, ped_dw
+    return "".join([
+        '1' if outs["veh_g"] else '0',
+        '1' if outs["veh_y"] else '0',
+        '1' if outs["veh_r"] else '0',
+        '1' if outs["ped_w"] else '0',
+        '1' if outs["ped_dw"] else '0',
+    ])
+
+# ===================== ARGUMENTOS CLI =====================
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--fast", action="store_true",
+                   help="Reduz latência descartando frames e usando inferência com frame reduzido")
+    p.add_argument("reset", nargs="?", default=None,
+                   help="Digite 'reset' para apagar a ROI e redesenhar")
+
+    # presets de webcam
+    p.add_argument("--480p", action="store_true", help="Força 640x480 @fps (padrão 30)")
+    p.add_argument("--720p", action="store_true", help="Força 1280x720 @fps (padrão 30)")
+    p.add_argument("--1080p", action="store_true", help="Força 1920x1080 @fps (padrão 30)")
+
+    # custom
+    p.add_argument("--width", type=int, help="Largura da webcam")
+    p.add_argument("--height", type=int, help="Altura da webcam")
+    p.add_argument("--fps", type=int, default=30, help="FPS desejado (padrão 30)")
+
+    # porta serial opcional
+    p.add_argument("--port", type=str, help="Porta serial do ESP32 (ex.: COM5, /dev/ttyUSB0)")
+    return p.parse_args()
+
 # ===================== MAIN =====================
 def main():
-    global tag_sim
+    global tag_sim, SER_PORT
 
-    FAST = ("--fast" in [a.lower() for a in sys.argv])
-    if len(sys.argv)>1 and sys.argv[1].lower()=="reset":
-        if os.path.exists(ROI_JSON): 
-            os.remove(ROI_JSON); 
+    args = parse_args()
+    FAST = args.fast
+
+    # reset ROI
+    if args.reset and args.reset.lower() == "reset":
+        if os.path.exists(ROI_JSON):
+            os.remove(ROI_JSON)
             print("ROI apagada.")
 
+    # Porta serial via CLI
+    if args.port:
+        SER_PORT = args.port
+
+    # === Serial com ESP ===
+    serial_ok = serial_init()
+    if not serial_ok:
+        print("[AVISO] Rodando sem ESP32 (sem saídas físicas).")
+
+    # === YOLO ===
     model=YOLO(YOLO_MODEL_PATH)
-    # Pequenas otimizações (se suportado)
     try: 
         model.fuse()
     except: 
         pass
 
+    # === Câmera ===
     cap=cv2.VideoCapture(CAMERA_URL)
     cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 30)
 
+    # Se for webcam, aplique presets e custom
+    is_webcam = isinstance(CAMERA_URL, int) or str(CAMERA_URL).isdigit()
+    if is_webcam:
+        if args.__dict__.get("480p"):
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, args.fps or 30)
+        elif args.__dict__.get("720p"):
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_FPS, args.fps or 30)
+        elif args.__dict__.get("1080p"):
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            cap.set(cv2.CAP_PROP_FPS, args.fps or 30)
+        if args.width and args.height:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        if args.fps:
+            cap.set(cv2.CAP_PROP_FPS, args.fps)
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except:
+            pass
+        print("Webcam em:",
+              int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+              "x",
+              int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+              "@",
+              int(cap.get(cv2.CAP_PROP_FPS)),
+              "fps")
 
     if not cap.isOpened(): 
         print("Nao abriu camera"); 
@@ -320,7 +454,6 @@ def main():
         cv2.namedWindow("Selecione ROI"); 
         cv2.setMouseCallback("Selecione ROI",mouse_cb,param="roi")
         while True:
-            # descarta frames pendentes (ajuda em RTSP)
             for _ in range(2): cap.grab()
             ok,frame=cap.read()
             if not ok: break
@@ -350,10 +483,13 @@ def main():
     infer_scale = 0.75 if FAST else 1.0
     imgsz = 640
 
+    # Controle de envio para o ESP
+    _last_bits = None
+    _last_tx_ms = 0
+
     while True:
         # === leitura de frame ===
         if FAST:
-            # descarta frames velhos (reduz latência em RTSP)
             for _ in range(2): 
                 cap.grab()
         ok,frame=cap.read()
@@ -363,16 +499,13 @@ def main():
         draw_poly(frame,roi,C_ROI,fill=True)
 
         # === detecção apenas de pessoas ===
-        if infer_scale != 1.0:
-            infer_frame = cv2.resize(frame, None, fx=infer_scale, fy=infer_scale, interpolation=cv2.INTER_LINEAR)
-        else:
-            infer_frame = frame
+        infer_frame = frame if infer_scale==1.0 else cv2.resize(
+            frame, None, fx=infer_scale, fy=infer_scale, interpolation=cv2.INTER_LINEAR)
 
         res = model(infer_frame, conf=DET_CONF, imgsz=imgsz, verbose=False)[0]
         pessoa_na_faixa=False
 
         if res.boxes is not None and len(res.boxes) > 0:
-            # mapeia coords de volta para o frame original, se necessário
             sx = (frame.shape[1] / infer_frame.shape[1])
             sy = (frame.shape[0] / infer_frame.shape[0])
 
@@ -387,7 +520,6 @@ def main():
                 cx,cy=(x1+x2)//2,(y1+y2)//2
                 inside=in_poly((cx,cy),roi)
 
-                # desenho básico para depuração
                 color = C_PESSOA if inside else (120,220,120)
                 cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
                 cv2.circle(frame,(cx,cy),4,color,-1)
@@ -395,13 +527,41 @@ def main():
                 if inside: 
                     pessoa_na_faixa=True
 
-        # === TAG simulação ===
+        # === RECEBE eventos do ESP (TAG/HB/PONG/BTN) ===
+        try:
+            while True:
+                line = rx_q.get_nowait()
+                # print("[ESP]:", line)  # debug
+                if line.startswith("TAG,"):
+                    uid = line.split(",",1)[1].strip()
+                    fsm.request_tag()              # RFID => pré-empção
+                elif line == "BTN,PED":
+                    fsm.request_tag()              # botão => pré-empção
+                elif line == "PONG":
+                    pass
+                elif line == "HB":
+                    pass
+        except queue.Empty:
+            pass
+
+        # === TAG simulação local (opcional) ===
         tag_sim.file_poll()
+        pulse,_=tag_sim.poll()
+        if pulse: 
+            fsm.request_tag()
 
         # === FSM e HUD ===
         fsm.update(pessoa_na_faixa)
         fsm.overlay(frame, pessoa_na_faixa)
         tag_sim.draw_button(frame)
+
+        # === Envia saídas físicas ao ESP (quando mudam ou a cada 500ms) ===
+        bits = outputs_to_bits(fsm.outputs)
+        now_ms = int(time.time() * 1000)
+        if serial_ok and (bits != _last_bits or (now_ms - _last_tx_ms) > 500):
+            ser_send(f"OUT,{bits}")
+            _last_bits = bits
+            _last_tx_ms = now_ms
 
         # === janela e teclado (ordem correta: imshow -> waitKey) ===
         cv2.imshow(MAIN_WIN,frame)
@@ -409,10 +569,8 @@ def main():
         if key==ord('q') or key==27: 
             break
         tag_sim.keypress(key)
-        pulse,_=tag_sim.poll()
-        if pulse: 
-            fsm.request_tag()   # acelera fechamento do verde carros se aplicável
 
+    # === finalizar ===
     cap.release(); 
     cv2.destroyAllWindows()
 

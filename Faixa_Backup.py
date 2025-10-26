@@ -1,7 +1,7 @@
 """
 ped_crosswalk_tag.py
 Sistema de faixa de pedestres com:
-- YOLOv8 (apenas pessoas) e ROI desenhável da faixa
+- YOLO11 (apenas pessoas) e ROI desenhável da faixa
 - Simulador de TAG (teclado 't'/'1'..'9', botão na tela, arquivo tag.trigger)
 - FSM:
     VEH_GREEN → VEH_YEL → ALL_RED_TO_PED → PED_GREEN → ALL_RED_TO_VEH → VEH_GREEN
@@ -42,6 +42,103 @@ YOLO_MODEL_PATH = "yolov8n.pt"
 CAMERA_URL = 1  # descomente para usar webcam
 
 ROI_JSON = "roi_pedestre.json"
+# ===================== MÓDULO: Ajuste Manual de Resolução =====================
+class CamResModule:
+    """
+    Atalhos:
+      F2        -> mostra/oculta painel
+      1 / 2 / 3 -> 480p / 720p / 1080p
+      + / -     -> aumenta/diminui FPS (se suportado)
+      c         -> ciclo 480→720→1080
+    """
+    PRESETS = {
+        "480p":  (640, 480, 30),
+        "720p":  (1280, 720, 30),
+        "1080p": (1920, 1080, 30),
+    }
+
+    def __init__(self, cap, default="720p"):
+        self.cap = cap
+        self.show_panel = False
+        self.current = None
+        self._order = ["480p", "720p", "1080p"]
+        if default in self.PRESETS:
+            self.apply(default)
+
+    def apply(self, name):
+        if name not in self.PRESETS: 
+            return
+        w,h,fps = self.PRESETS[name]
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.cap.set(cv2.CAP_PROP_FPS,          fps)
+        try:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except:
+            pass
+        # lê de volta o que ficou de fato
+        rw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        rh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        rf = int(self.cap.get(cv2.CAP_PROP_FPS))
+        self.current = (name, rw, rh, rf)
+
+    def bump_fps(self, delta):
+        if not self.current: return
+        name, rw, rh, rf = self.current
+        target = max(5, min(120, rf + delta))
+        self.cap.set(cv2.CAP_PROP_FPS, target)
+        rf2 = int(self.cap.get(cv2.CAP_PROP_FPS))
+        self.current = (name, rw, rh, rf2)
+
+    def cycle(self):
+        if not self.current:
+            self.apply("720p"); return
+        name = self.current[0]
+        i = self._order.index(name)
+        self.apply(self._order[(i+1)%len(self._order)])
+
+    def handle_key(self, k):
+        if k == ord('\t'):  # (backup se F2 não existir no teclado)
+            self.show_panel = not self.show_panel; return True
+        if k == ord('c'):
+            self.cycle(); return True
+        if k == ord('+') or k == ord('='):
+            self.bump_fps(+5); return True
+        if k == ord('-') or k == ord('_'):
+            self.bump_fps(-5); return True
+        if k == ord('1'):
+            self.apply("480p"); return True
+        if k == ord('2'):
+            self.apply("720p"); return True
+        if k == ord('3'):
+            self.apply("1080p"); return True
+        # F2 (teclas especiais vêm como códigos; alguns ambientes mapeiam para 0)
+        if k == 0x00 or k == 0x3C:  # cobertura ampla; se não funcionar, use TAB
+            self.show_panel = not self.show_panel; return True
+        return False
+
+    def overlay(self, frame):
+        if not self.show_panel: 
+            return
+        h, w = frame.shape[:2]
+        text = ["RESOLUCAO (F2 fecha)",
+                "1: 480p   2: 720p   3: 1080p",
+                "+/-: FPS   c: ciclo 480→720→1080"]
+        if self.current:
+            name, rw, rh, rf = self.current
+            text.append(f"Atual: {name} -> {rw}x{rh}@{rf}fps")
+        pad = 8
+        box_w = max(320, max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0][0] for t in text) + 2*pad)
+        box_h = 30*len(text) + 2*pad
+        x = 20; y = 20
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x,y), (x+box_w, y+box_h), (30,30,30), -1)
+        frame[:] = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        cv2.rectangle(frame, (x,y), (x+box_w, y+box_h), (200,200,200), 2)
+        yy = y + pad + 22
+        for i, t in enumerate(text):
+            cv2.putText(frame, t, (x+pad, yy + i*28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
 
 # Classes (COCO): 0=person
 CL_PESSOA = {0}
@@ -294,6 +391,10 @@ def main():
     cap=cv2.VideoCapture(CAMERA_URL)
     cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
 
+    # Módulo de ajuste manual (inicia em 720p; mude se quiser)
+    resmod = CamResModule(cap, default="1080p")
+
+
     if not cap.isOpened(): 
         print("Nao abriu camera"); 
         return
@@ -316,7 +417,6 @@ def main():
         cv2.namedWindow("Selecione ROI"); 
         cv2.setMouseCallback("Selecione ROI",mouse_cb,param="roi")
         while True:
-            # descarta frames pendentes (ajuda em RTSP)
             for _ in range(2): cap.grab()
             ok,frame=cap.read()
             if not ok: break
