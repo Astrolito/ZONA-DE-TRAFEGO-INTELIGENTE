@@ -1,45 +1,34 @@
-import pyaudio
-import wave
-import av
+# deteccao_sirene.py
+import sounddevice as sd
+import numpy as np
+import librosa
 
-# Captura com PyAudio
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 44100
-RECORD_SECONDS = 5
-OUTPUT_FILENAME = "output.wav"
+def detectar_sirene(caminho_sirene="collected_audio/siren_1761581600.wav", duracao=3, limite=0.8):
+    """
+    Escuta o ambiente por alguns segundos e compara com o som de sirene.
+    Retorna True se detectar som de ambulância.
+    """
 
-audio = pyaudio.PyAudio()
+    try:
+        # Carrega o som da sirene de referência
+        sirene, sr_sirene = librosa.load(caminho_sirene, sr=None)
 
-stream = audio.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
+        print("🎧 Ouvindo o ambiente...")
+        audio = sd.rec(int(duracao * sr_sirene), samplerate=sr_sirene, channels=1)
+        sd.wait()
+        print("🎙️ Gravação concluída.")
 
-frames = []
-print("Gravando...")
+        # Converte para o mesmo formato
+        audio = audio.flatten()
 
-for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-    data = stream.read(CHUNK)
-    frames.append(data)
+        # Calcula similaridade (correlação cruzada)
+        correlacao = np.correlate(audio, sirene, mode='valid')
+        semelhanca = np.max(correlacao) / len(sirene)
 
-print("Gravação finalizada.")
-stream.stop_stream()
-stream.close()
-audio.terminate()
+        print(f"🔊 Nível de semelhança: {semelhanca:.2f}")
 
-# Salvar como WAV
-wf = wave.open(OUTPUT_FILENAME, 'wb')
-wf.setnchannels(CHANNELS)
-wf.setsampwidth(audio.get_sample_size(FORMAT))
-wf.setframerate(RATE)
-wf.writeframes(b''.join(frames))
-wf.close()
+        return semelhanca > limite
 
-# Processar com PyAV
-container = av.open(OUTPUT_FILENAME)
-for packet in container.demux():
-    for frame in packet.decode():
-        print(frame)
+    except Exception as e:
+        print(f"⚠️ Erro na detecção da sirene: {e}")
+        return False

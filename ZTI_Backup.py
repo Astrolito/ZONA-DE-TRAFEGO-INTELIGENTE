@@ -33,7 +33,7 @@ from ultralytics import YOLO
 YOLO_MODEL_PATH = "yolo11s.pt"
 
 # Webcam/stream
-DEFAULT_CAMERA = "video3.mp4"  # índice ou URL (RTSP/HTTP)
+DEFAULT_CAMERA = 1 #"video3.mp4"  # índice ou URL (RTSP/HTTP)
 
 # ROI (duas zonas)
 ROI_JSON = "roi_2zones.json"  # {"zoneA":[(x,y),...], "zoneB":[(x,y),...]}
@@ -42,7 +42,7 @@ ROI_JSON = "roi_2zones.json"  # {"zoneA":[(x,y),...], "zoneB":[(x,y),...]}
 VEHICLE_CLASSES = [2, 3, 5, 7]
 DET_CONF = 0.25           # ligeiramente baixo por serem objetos pequenos
 MIN_BBOX_AREA_FRAC = 1e-5 # min área do bbox vs área do frame (para carrinhos)
-IMG_SZ = 240
+IMG_SZ = 640
 
 # Cores
 C_ZONEA = (50, 200, 255)
@@ -131,18 +131,13 @@ GREEN_EXT_STEP = 4      # extensão quando há fila
 GREEN_MAX = 40          # teto de verde para evitar starvation
 
 class TwoZoneController:
-    """
-    Fases:
-      NS_GREEN → NS_YEL → ALL_RED → EW_GREEN → EW_YEL → ALL_RED → loop
-    - Demanda: presença de veículos em cada zona
-    - Extensão: enquanto houver fila na zona atual, até GREEN_MAX
-    Saídas: ns_g, ns_y, ns_r, ew_g, ew_y, ew_r
-    """
+    
     def __init__(self):
         self.phase = Phase.NS_GREEN
         self.t0 = time.monotonic()
         self.tgt = BASE_GREEN
         self.outputs = dict(ns_g=True, ns_y=False, ns_r=False, ew_g=False, ew_y=False, ew_r=True)
+        self._last_green_ns = True  # para desempate alternando
 
     def _reset(self, dur):
         self.t0 = time.monotonic()
@@ -157,54 +152,69 @@ class TwoZoneController:
     def _outs(self, ns_g, ns_y, ns_r, ew_g, ew_y, ew_r):
         self.outputs = dict(ns_g=ns_g, ns_y=ns_y, ns_r=ns_r, ew_g=ew_g, ew_y=ew_y, ew_r=ew_r)
 
-    def update(self, demand_ns: bool, demand_ew: bool):
+    def update(self, count_ns: int, count_ew: int):
+        """Atualiza FSM usando contagens. Retorna a fase atual."""
         # NS GREEN
         if self.phase == Phase.NS_GREEN:
             self._outs(True, False, False, False, False, True)
+            # terminou alvo atual?
             if self._elapsed() >= self.tgt:
-                if demand_ns and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
+                # Extende se NS tem >= EW e há veículos (evita starvation do lado com mais fila)
+                if count_ns > 0 and (count_ns >= count_ew) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
                     self.tgt += GREEN_EXT_STEP
                 else:
-                    self.phase = Phase.NS_YEL; self._reset(YEL_TIME)
+                    self.phase = Phase.NS_YEL
+                    self._reset(YEL_TIME)
+                    self._last_green_ns = True
 
         # NS YELLOW
         elif self.phase == Phase.NS_YEL:
             self._outs(False, True, False, False, False, True)
             if self._elapsed() >= self.tgt:
-                self.phase = Phase.ALL_RED; self._reset(ALL_RED_TIME)
+                self.phase = Phase.ALL_RED
+                self._reset(ALL_RED_TIME)
 
         # ALL RED
         elif self.phase == Phase.ALL_RED:
             self._outs(False, False, True, False, False, True)
             if self._elapsed() >= self.tgt:
-                # prioridade: quem tem demanda
-                if demand_ns and not demand_ew:
-                    self.phase = Phase.NS_GREEN; self._reset(max(BASE_GREEN, MIN_GREEN))
-                elif demand_ew and not demand_ns:
-                    self.phase = Phase.EW_GREEN; self._reset(max(BASE_GREEN, MIN_GREEN))
+                # Escolha por contagem
+                if (count_ns > 0 or count_ew > 0) and (count_ns != count_ew):
+                    if count_ns > count_ew:
+                        self.phase = Phase.NS_GREEN
+                    else:
+                        self.phase = Phase.EW_GREEN
+                    self._reset(max(MIN_GREEN, BASE_GREEN))
                 else:
-                    # empates/sem demanda: alterna
-                    self.phase = Phase.EW_GREEN if self.outputs["ns_r"] else Phase.NS_GREEN
+                    # Sem demanda ou empate: alterna
+                    if self._last_green_ns:
+                        self.phase = Phase.EW_GREEN
+                    else:
+                        self.phase = Phase.NS_GREEN
                     self._reset(MIN_GREEN)
 
         # EW GREEN
         elif self.phase == Phase.EW_GREEN:
             self._outs(False, False, True, True, False, False)
             if self._elapsed() >= self.tgt:
-                if demand_ew and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
+                # Extende se EW tem >= NS e há veículos
+                if count_ew > 0 and (count_ew >= count_ns) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
                     self.tgt += GREEN_EXT_STEP
                 else:
-                    self.phase = Phase.EW_YEL; self._reset(YEL_TIME)
+                    self.phase = Phase.EW_YEL
+                    self._reset(YEL_TIME)
+                    self._last_green_ns = False
 
         # EW YELLOW
         elif self.phase == Phase.EW_YEL:
             self._outs(False, False, True, False, True, False)
             if self._elapsed() >= self.tgt:
-                self.phase = Phase.ALL_RED; self._reset(ALL_RED_TIME)
+                self.phase = Phase.ALL_RED
+                self._reset(ALL_RED_TIME)
 
         return self.phase
 
-    def overlay(self, frame, demand_ns, demand_ew):
+    def overlay(self, frame, count_ns, count_ew):
         def put_right(y, text, scale=0.85, color=(255,255,255), th=2):
             (w,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, th)
             x = frame.shape[1] - 20 - w
@@ -219,22 +229,30 @@ class TwoZoneController:
             Phase.EW_YEL:   "EW: AMARELO",
         }[self.phase]
 
-        put_right(40, f"{phase_name} | T-{int(round(self.remaining()))}s")
-        put_right(70, f"Demanda NS: {'SIM' if demand_ns else 'NAO'}", 0.8, (200,255,200))
-        put_right(95, f"Demanda EW: {'SIM' if demand_ew else 'NAO'}", 0.8, (200,255,200))
+        # Prioridade textual (quem tem mais veículos)
+        priority = "NS" if count_ns > count_ew else ("EW" if count_ew > count_ns else "EMPATE")
 
-# ===================== DESENHO DOS SEMÁFOROS NA TELA =====================
+        put_right(40, f"{phase_name} | T-{int(round(self.remaining()))}s")
+        put_right(70,  f"Veiculos Zona A (NS): {count_ns}", 0.8, (200,255,200))
+        put_right(95,  f"Veiculos Zona B (EW): {count_ew}", 0.8, (200,255,200))
+        put_right(120, f"Prioridade (maior fila): {priority}", 0.8, (255,230,180))
+
 def draw_traffic_lights(frame, outs):
     # blocos NS e EW no canto superior esquerdo
     def draw_light(x, y, on_r, on_y, on_g, label):
-        cv2.putText(frame, label, (x-5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30,30,30), 2)
-        cv2.circle(frame, (x, y),   10, (0,0,255) if on_r else (60,60,60), -1)
-        cv2.circle(frame, (x, y+25),10, (0,255,255) if on_y else (60,60,60), -1)
-        cv2.circle(frame, (x, y+50),10, (0,170,0)   if on_g else (60,60,60), -1)
+        cv2.putText(frame, label, (x-5, y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30,30,30), 2)
+        cv2.circle(frame, (x, y),   10,
+                   (0,0,255) if on_r else (60,60,60), -1)
+        cv2.circle(frame, (x, y+25),10,
+                   (0,255,255) if on_y else (60,60,60), -1)
+        cv2.circle(frame, (x, y+50),10,
+                   (0,170,0) if on_g else (60,60,60), -1)
         cv2.rectangle(frame, (x-18, y-18), (x+18, y+68), (80,80,80), 2)
 
     draw_light(40, 40,  outs["ns_r"], outs["ns_y"], outs["ns_g"], "NS")
     draw_light(100, 40, outs["ew_r"], outs["ew_y"], outs["ew_g"], "EW")
+
 
 # ===================== MAIN =====================
 def main():
@@ -368,6 +386,7 @@ def main():
     min_area_abs = MIN_BBOX_AREA_FRAC * (H * W)
 
     def bbox_roi_overlap(x1,y1,x2,y2, mask, thr=0.06):
+        
         x1 = max(0, x1); y1 = max(0, y1)
         x2 = min(mask.shape[1]-1, x2); y2 = min(mask.shape[0]-1, y2)
         if x2 <= x1 or y2 <= y1: return False
@@ -376,6 +395,18 @@ def main():
         if area_bbox <= 0: return False
         area_in = int((crop > 0).sum())
         return (area_in / float(area_bbox)) >= thr
+    def bbox_roi_overlap_ratio(x1,y1,x2,y2, mask):
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(mask.shape[1]-1, x2); y2 = min(mask.shape[0]-1, y2)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        crop = mask[y1:y2, x1:x2]
+        area_bbox = (x2-x1)*(y2-y1)
+        if area_bbox <= 0:
+            return 0.0
+        area_in = int((crop > 0).sum())
+        return area_in / float(area_bbox)
+
 
     while True:
         if FAST:
@@ -402,8 +433,9 @@ def main():
         sx = frame.shape[1] / infer_frame.shape[1]
         sy = frame.shape[0] / infer_frame.shape[0]
 
-        demandA = False
-        demandB = False
+                # Contagem por zona + desenho
+        countA = 0
+        countB = 0
 
         if res.boxes is not None and len(res.boxes) > 0:
             for b in res.boxes:
@@ -416,19 +448,36 @@ def main():
                 if area < min_area_abs:
                     continue
 
-                insideA = bbox_roi_overlap(x1,y1,x2,y2, maskA, thr=0.06)
-                insideB = bbox_roi_overlap(x1,y1,x2,y2, maskB, thr=0.06)
+                # Fração de interseção com cada máscara
+                fracA = bbox_roi_overlap_ratio(x1,y1,x2,y2, maskA)
+                fracB = bbox_roi_overlap_ratio(x1,y1,x2,y2, maskB)
 
+                # Atribui o bbox à zona de MAIOR fração (com pequeno threshold)
+                assigned = None
+                if max(fracA, fracB) >= 0.06:
+                    if fracA > fracB:
+                        countA += 1
+                        assigned = "A"
+                    elif fracB > fracA:
+                        countB += 1
+                        assigned = "B"
+                    else:
+                        # empate raro: não conta para evitar dupla contagem
+                        assigned = None
+
+                # cor de feedback
                 color = C_BOX2
-                if insideA or insideB: color = C_BOX
+                if assigned == "A" or assigned == "B":
+                    color = C_BOX
                 cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
 
-                if insideA: demandA = True
-                if insideB: demandB = True
+        # === Atualiza controlador e HUD com contagens ===
+        ctl.update(countA, countB)
+        ctl.overlay(frame, countA, countB)
 
         # === Atualiza controlador e HUD ===
-        ctl.update(demandA, demandB)
-        ctl.overlay(frame, demandA, demandB)
+        ctl.update(countA, countB)
+        ctl.overlay(frame, countA, countB)
 
         # Desenho dos semáforos simulados
         draw_traffic_lights(frame, ctl.outputs)
