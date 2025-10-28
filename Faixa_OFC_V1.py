@@ -1,40 +1,14 @@
 """
-ped_crosswalk_tag.py
-Sistema de faixa de pedestres com:
-- YOLOv8 (apenas pessoas) e ROI desenhável da faixa
-- Integração por CABO com ESP32 (RFID RC522 + BOTÃO físico):
-    * PC → ESP: OUT,<b0..b4>  (veh_g,veh_y,veh_r,ped_w,ped_dw)
-    * PC → ESP: PING          (ESP responde PONG)
-    * ESP → PC: TAG,<uidhex>  (cartão lido)
-    * ESP → PC: BTN,PED       (botão físico pressionado)
-    * ESP → PC: HB            (heartbeat 1s)
-- Simulador de TAG local (teclado 't'/'1'..'9', botão na tela, arquivo tag.trigger)
-- FSM:
-    VEH_GREEN → VEH_YEL → ALL_RED_TO_PED → PED_GREEN → ALL_RED_TO_VEH → VEH_GREEN
-- Pré-empção (TAG/BOTÃO): reduz o VERDE dos carros para 5s restantes (não vai direto ao amarelo)
-- PED_GREEN: bônus inicial se já houver pessoa e EXTENSÃO contínua enquanto houver pessoa
-- HUD: estados, “Pessoa na faixa: SIM/NAO”, mini semáforos, indicadores de TAG/BOTÃO e UID
-- CLI webcam: --480p / --720p / --1080p / --width/--height/--fps
-- Modo --fast: descarta frames antigos e faz inferência em frame reduzido
+ped_crosswalk_tag.py  —  Faixa inteligente com TTS + buzzer virtual
 
-Instalação:
-    pip install ultralytics opencv-python numpy pyserial
-
-Como rodar:
-    python ped_crosswalk_tag.py
-    python ped_crosswalk_tag.py --fast
-    python ped_crosswalk_tag.py --720p
-    python ped_crosswalk_tag.py reset   # apaga ROI e redesenha
-
-Controles:
-    q       -> sair
-    t       -> simula TAG
-    1..9    -> simula TAG com ID
-    Clique no botão "TAG" na tela
-    touch tag.trigger -> dispara uma vez (crie o arquivo vazio na pasta)
+Novidades de áudio:
+- Buzzer virtual: bip a cada 1s enquanto PED_GREEN (aberto).
+- TTS:
+    * Ao iniciar o pisca dos CARROS (fase amarela): "O sinal ira abrir em breve".
+    * Ao iniciar o pisca do PEDESTRE (pré-fechamento): "O sinal fechara em breve".
 """
 
-import sys, os, time, json, argparse
+import sys, os, time, json, argparse, threading, queue
 from enum import Enum
 from typing import List, Tuple
 
@@ -42,19 +16,219 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Serial / threading
+# Serial
 import serial, serial.tools.list_ports
-import threading, queue
+
+# ===================== ÁUDIO (TTS + BUZZER) =====================
+class AudioManager:
+    """
+    - TTS com pyttsx3 (se presente). Não bloqueia a UI (roda em thread).
+    - Buzzer virtual usando simpleaudio (se presente) ou winsound no Windows.
+    """
+    def __init__(self):
+        # ---- TTS ----
+        self._tts_ok = False
+        self._tts_lock = threading.Lock()
+        self._tts_ready = threading.Event()
+        self._tts_queue = queue.Queue(maxsize=32)
+        try:
+            import pyttsx3
+            self._engine = pyttsx3.init()
+                        # ---- TTS ----
+            self._tts_ok = False
+            self._tts_lock = threading.Lock()
+            self._tts_ready = threading.Event()
+            self._tts_queue = queue.Queue(maxsize=32)
+            try:
+                import pyttsx3
+                self._engine = pyttsx3.init()
+
+                # >>> ADICIONE DAQUI ↓↓↓
+                try:
+                    voices = self._engine.getProperty('voices')
+                    for v in voices:
+                        name = (getattr(v, "name", "") or "").lower()
+                        lang = "".join(getattr(v, "languages", [])).lower() if hasattr(v,"languages") else ""
+                        # Ajusta para voz PT-BR se existir no sistema
+                        if ("portuguese" in name and ("brazil" in name or "brasil" in name)) or \
+                        ("pt_br" in lang or "pt-br" in lang):
+                            self._engine.setProperty('voice', v.id)
+                            print("[TTS] Voz PT-BR selecionada:", v.name)
+                            break
+                except Exception as e:
+                    print("[TTS] Nao consegui aplicar voz PT-BR:", e)
+                # >>> ATÉ AQUI ↑↑↑
+
+                # velocidade um pouco maior
+                try:
+                    rate = self._engine.getProperty('rate')
+                    self._engine.setProperty('rate', int(rate * 1.05))
+                except Exception:
+                    pass
+
+                self._tts_ok = True
+                th = threading.Thread(target=self._tts_worker, daemon=True)
+                th.start()
+
+            except Exception:
+                self._tts_ok = False
+                self._engine = None
+
+            # voz levemente mais rápida e clara
+            try:
+                rate = self._engine.getProperty('rate')
+                self._engine.setProperty('rate', int(rate * 1.05))
+            except Exception:
+                pass
+            self._tts_ok = True
+            th = threading.Thread(target=self._tts_worker, daemon=True)
+            th.start()
+        except Exception:
+            self._tts_ok = False
+            self._engine = None
+
+        # ---- BUZZER ----
+        self._buzz_enable = False
+        self._buzz_stop = threading.Event()
+        self._buzz_thread = threading.Thread(target=self._buzz_worker, daemon=True)
+        self._buzz_thread.start()
+
+        # backend tone
+        self._sa = None
+        self._has_winsound = False
+        try:
+            import simpleaudio  # noqa
+            self._sa = simpleaudio
+        except Exception:
+            self._sa = None
+        try:
+            import winsound  # noqa
+            self._has_winsound = True
+        except Exception:
+            self._has_winsound = False
+
+        # pré-gera um tom curto (1000 Hz ~150 ms) se simpleaudio disponível
+        self._sa_wave = None
+        if self._sa:
+            self._sa_wave = self._make_sine_wave(freq=1000, ms=150)
+
+        # antispam para frases
+        self._last_phrase_ts = {}
+
+    # --------- TTS ----------
+    def speak(self, text: str, min_interval=3.0):
+        """
+        Enfileira uma fala. 'min_interval' evita repetição muito próxima.
+        """
+        now = time.time()
+        last = self._last_phrase_ts.get(text, 0.0)
+        if (now - last) < min_interval:
+            return
+        self._last_phrase_ts[text] = now
+
+        if not self._tts_ok:
+            # fallback: apenas imprime
+            print("[TTS]", text)
+            return
+        try:
+            self._tts_queue.put_nowait(text)
+        except queue.Full:
+            pass
+
+    def _tts_worker(self):
+        while True:
+            try:
+                text = self._tts_queue.get()
+            except Exception:
+                text = None
+            if not text:
+                time.sleep(0.05)
+                continue
+            try:
+                with self._tts_lock:
+                    self._engine.say(text)
+                    self._engine.runAndWait()
+            except Exception as e:
+                print("[TTS] erro:", e)
+
+    # --------- BUZZER ----------
+    def buzzer(self, enable: bool):
+        """
+        Liga/desliga o buzzer em loop de 1s (150ms ligado / 850ms silêncio).
+        """
+        self._buzz_enable = bool(enable)
+        if enable:
+            self._buzz_stop.set()   # acorda o worker
+        else:
+            self._buzz_stop.set()
+
+    def _buzz_worker(self):
+        """
+        Loop cooperativo: quando _buzz_enable=True, toca um BIP curto a cada 1s.
+        """
+        PERIOD = 1.0   # 1 segundo entre inícios de bip
+        ON_MS = 150    # duração do bip ~150 ms
+        while True:
+            self._buzz_stop.wait(timeout=0.05)
+            self._buzz_stop.clear()
+
+            # pequeno ciclo interno para latência baixa
+            start = time.time()
+            while self._buzz_enable:
+                t0 = time.time()
+                self._beep_ms(ON_MS)
+                # espera o resto do período
+                elapsed = time.time() - t0
+                rest = max(0.0, PERIOD - elapsed)
+                # interrompe rápido se alguém desligar
+                for _ in range(int(rest / 0.02) + 1):
+                    if not self._buzz_enable:
+                        break
+                    time.sleep(0.02)
+                # se desligou no meio, sai do laço do buzzer
+                if not self._buzz_enable:
+                    break
+            # idle curto
+            time.sleep(0.05)
+
+    def _make_sine_wave(self, freq=1000, ms=150, sample_rate=44100):
+        import numpy as _np
+        t = _np.linspace(0, ms/1000.0, int(sample_rate * ms/1000.0), False)
+        wave = _np.sin(2 * _np.pi * freq * t) * 0.3
+        audio = (wave * 32767).astype(_np.int16)
+        # mono 16-bit little-endian
+        return audio
+
+    def _beep_ms(self, ms=150, freq=1000):
+        # Preferência: winsound no Windows (baixa latência)
+        if self._has_winsound:
+            try:
+                import winsound
+                winsound.Beep(freq, int(ms))
+                return
+            except Exception:
+                pass
+        # Depois: simpleaudio com seno pré-gerado
+        if self._sa and self._sa_wave is not None:
+            try:
+                obj = self._sa.play_buffer(self._sa_wave.tobytes(), 1, 2, 44100)
+                # espera ~ms sem travar por muito
+                obj.wait_done()
+                return
+            except Exception:
+                pass
+        # Último fallback: print
+        print("[BUZZER] BIP")
 
 # ===================== CONFIG BÁSICA =====================
 YOLO_MODEL_PATH = "yolo11n.pt"
-CAMERA_URL = 1  # use 0 / 1 / 2... para webcams
+CAMERA_URL = 0  # use 0 / 1 / 2... para webcams
 ROI_JSON = "roi_pedestre.json"
-MANUAL_RES = 1080   # escolha: 480 / 720 / 1080 / ou None para ignorar
+MANUAL_RES = 1080   # 480 / 720 / 1080 / None
 
 # Classes (COCO): 0=person
 CL_PESSOA = {0}
-DET_CONF = 0.45  # levemente menor para capturar pedestres mais difíceis
+DET_CONF = 0.45
 
 # Cores
 C_PESSOA = (0, 255, 0)
@@ -73,11 +247,11 @@ class TagSimulator:
         self._last  = 0.0
         self._tagid = None
 
-    def _ok(self): 
+    def _ok(self):
         return (time.time() - self._last) >= self.COOLDOWN
 
     def keypress(self, k):
-        if not self._ok(): 
+        if not self._ok():
             return
         if k == ord('t'):
             self._pulse, self._tagid, self._last = True, None, time.time()
@@ -85,19 +259,19 @@ class TagSimulator:
             self._pulse, self._tagid, self._last = True, int(chr(k)), time.time()
 
     def click(self, x, y):
-        if not self._ok(): 
+        if not self._ok():
             return
         x1,y1,x2,y2 = self.TAG_BUTTON_RECT
         if x1<=x<=x2 and y1<=y<=y2:
             self._pulse, self._tagid, self._last = True, None, time.time()
 
     def file_poll(self):
-        if not self._ok(): 
+        if not self._ok():
             return
         if os.path.exists(self.FILE_TRIGGER):
-            try: 
+            try:
                 os.remove(self.FILE_TRIGGER)
-            except: 
+            except:
                 pass
             self._pulse, self._tagid, self._last = True, None, time.time()
 
@@ -127,28 +301,30 @@ class State(Enum):
     ALL_RED_TO_VEH=5
 
 # Tempos (s)
-VEH_GREEN_DEFAULT=20       # verde carros normal
-VEH_YEL_TIME=5             # amarelo carros (valor base — será substituído pela janela de pisca)
-ALL_RED_CLEAR=3            # intertravamentos (antes e depois do pedestre)
-PED_GREEN_BASE=12          # pedestre base
-PED_EXT_STEP=5             # extensão por detecção contínua
-PEDESTRIAN_CLEAR_GRACE=5   # faixa livre por Xs para encerrar pedestre
-PED_ENTRY_BOOST=5          # bônus inicial se já houver pessoa ao abrir pedestre
+VEH_GREEN_DEFAULT=20
+VEH_YEL_TIME=5
+ALL_RED_CLEAR=3
+PED_GREEN_BASE=12
+PED_EXT_STEP=5
+PEDESTRIAN_CLEAR_GRACE=5
+PED_ENTRY_BOOST=5
 
-# Preempção por TAG/BOTÃO
-MIN_GREEN_BEFORE_PREEMPT=5   # verde mínimo antes de aceitar pré-empção
-PREEMPT_CUT_TO=5             # (não usado diretamente; mantido p/ compatibilidade)
+# Preempção
+MIN_GREEN_BEFORE_PREEMPT=5
+PREEMPT_CUT_TO=5
 
-# --- Pisca ---
-BLINK_PERIOD_S = 1.0     # 1 segundo total (0.5 on/0.5 off)
-BLINK_COUNT = 5          # 5 piscadas (~5s)
+# Pisca
+BLINK_PERIOD_S = 1.0
+BLINK_COUNT = 5
 
 class TrafficLightFSM:
     """
-    Ciclo: VEH_GREEN → VEH_YEL → ALL_RED_TO_PED → PED_GREEN → ALL_RED_TO_VEH → VEH_GREEN
-    - Pré-empção em VERDE carros: reduz o VERDE para restar 5s (não vai direto ao amarelo).
-    - VEH_YEL: pisca amarelo por ~5s (5 toques de 1s) antes do vermelho.
-    - PED_GREEN: extensão enquanto houver pessoa; ao fechar, pisca verde por ~5s antes de fechar.
+    Retorna (state, events) em update().
+    events pode conter:
+      - "veh_yel_blink_start"
+      - "ped_open_start"
+      - "ped_green_blink_start"
+      - "ped_open_end"
     """
     def __init__(self):
         self.state=State.VEH_GREEN
@@ -157,21 +333,20 @@ class TrafficLightFSM:
         self.last_seen_person_ts=None
         # Saídas
         self.outputs=dict(veh_g=True,veh_y=False,veh_r=False,ped_w=False,ped_dw=True)
-        # estados internos de pisca
-        self._yel_blink_start = None      # para VEH_YEL
-        self._ped_blink_start = None      # para pré-fechamento do PED_GREEN
+        # Pisca
+        self._yel_blink_start = None
+        self._ped_blink_start = None
         self._ped_blinking = False
 
-    def _reset(self,dur): 
+    def _reset(self,dur):
         self.t0=time.monotonic(); self.tgt=dur
-    def _elapsed(self): 
+    def _elapsed(self):
         return time.monotonic()-self.t0
-    def remaining(self): 
+    def remaining(self):
         return max(0.0,self.tgt-self._elapsed())
-    def request_tag(self): 
+    def request_tag(self):
         self.tag_pending=True
 
-    # --- Controle de pisca ---
     def _blink_on(self, start_ts, period=BLINK_PERIOD_S):
         if start_ts is None:
             return True
@@ -183,40 +358,37 @@ class TrafficLightFSM:
 
     def update(self,pessoa_na_faixa:bool):
         now=time.monotonic()
+        events=[]
 
-        # Pré-empção durante VERDE carros: reduzir para 5s restantes (sem trocar de estado)
+        # Pré-empção no VERDE carros: reduzir para 5s restantes (sem trocar de estado)
         if self.state == State.VEH_GREEN and self.tag_pending:
             if self._elapsed() >= MIN_GREEN_BEFORE_PREEMPT:
                 self.t0 = time.monotonic()
                 self.tgt = 5.0
-                self.tag_pending = False  # consumido
+                self.tag_pending = False
 
-        # VEHICLE GREEN
+        # VEH GREEN
         if self.state==State.VEH_GREEN:
             self._outs(True,False,False,False,True)
-            # limpesa de flags de pisca por segurança
             self._yel_blink_start = None
             if self._elapsed()>=self.tgt:
                 self.state=State.VEH_YEL
-                # ao entrar no amarelo, iniciaremos janela de pisca no bloco do estado
+                # janela de pisca iniciará na próxima avaliação
 
-        # VEHICLE YELLOW (pisca ~5s)
+        # VEH YEL (pisca ~5s)
         elif self.state == State.VEH_YEL:
             if self._yel_blink_start is None:
                 self._yel_blink_start = time.monotonic()
-                # garante ~5s de janela de pisca
                 self._reset(BLINK_COUNT * BLINK_PERIOD_S)
-
+                events.append("veh_yel_blink_start")  # ← gatilho de TTS
             yellow_on = self._blink_on(self._yel_blink_start, BLINK_PERIOD_S)
             self._outs(False, yellow_on, False, False, True)
-
             if self._elapsed() >= self.tgt:
-                # fim da janela de pisca → vermelho (ALL_RED_TO_PED)
                 self._yel_blink_start = None
                 self.state = State.ALL_RED_TO_PED
                 self._reset(ALL_RED_CLEAR)
 
-        # ALL RED → preparar para abrir pedestre (pedestre FECHADO aqui)
+        # ALL RED → preparar pedestre
         elif self.state==State.ALL_RED_TO_PED:
             self._outs(False,False,True,False,True)
             if self._elapsed()>=self.tgt:
@@ -224,12 +396,12 @@ class TrafficLightFSM:
                 extra = PED_ENTRY_BOOST if pessoa_na_faixa else 0
                 self._reset(PED_GREEN_BASE + extra)
                 self.last_seen_person_ts = now if pessoa_na_faixa else None
-                self.tag_pending=False  # consome tag/botão
-                # limpa pisca pedestre
+                self.tag_pending=False
                 self._ped_blinking = False
                 self._ped_blink_start = None
+                events.append("ped_open_start")  # ← ligar buzzer
 
-        # PED GREEN (abre; ao encerrar, pisca verde por ~5s)
+        # PED GREEN
         elif self.state==State.PED_GREEN:
             if pessoa_na_faixa:
                 self.last_seen_person_ts = now
@@ -238,28 +410,27 @@ class TrafficLightFSM:
             nobody_recent = (self.last_seen_person_ts is None) or ((now - self.last_seen_person_ts) >= PEDESTRIAN_CLEAR_GRACE)
 
             if not self._ped_blinking:
-                # fase contínua (verde fixo)
+                # verde fixo
                 self._outs(False,False,True,True,False)
                 if base_done:
                     if nobody_recent:
-                        # inicia janela de pisca do pedestre (~5s)
+                        # inicia pisca ~5s
                         self._ped_blinking = True
                         self._ped_blink_start = time.monotonic()
                         self._reset(BLINK_COUNT * BLINK_PERIOD_S)
+                        events.append("ped_green_blink_start")  # ← TTS + desligar buzzer
                     else:
-                        # extensão contínua
                         self.tgt += PED_EXT_STEP
             else:
-                # fase de pisca do pedestre
+                # fase de pisca
                 ped_green_on = self._blink_on(self._ped_blink_start, BLINK_PERIOD_S)
                 self._outs(False,False,True,ped_green_on,False)
-
                 if self._elapsed() >= self.tgt:
-                    # encerra pisca → fecha pedestre
                     self._ped_blinking = False
                     self._ped_blink_start = None
                     self.state=State.ALL_RED_TO_VEH
                     self._reset(ALL_RED_CLEAR)
+                    events.append("ped_open_end")  # ← garantir buzzer off
 
         # ALL RED → voltar carros
         elif self.state==State.ALL_RED_TO_VEH:
@@ -268,12 +439,11 @@ class TrafficLightFSM:
                 self.state=State.VEH_GREEN
                 self._reset(VEH_GREEN_DEFAULT)
                 self.last_seen_person_ts=None
-                # limpa qualquer pisca remanescente
                 self._yel_blink_start = None
                 self._ped_blinking = False
                 self._ped_blink_start = None
 
-        return self.state
+        return self.state, events
 
     # HUD helpers
     @staticmethod
@@ -298,26 +468,26 @@ class TrafficLightFSM:
         self._put_right(frame,f"Pedestre: {ped_state}",100,0.85,(200,220,255))
         self._put_right(frame,f"Pessoa na faixa: {'SIM' if pessoa_na_faixa else 'NAO'}",130,0.85,(255,255,255))
 
-# ===================== ROI e utilitários =====================
+# ===================== ROI/util =====================
 _clicked: List[Tuple[int,int]]=[]; _selecting=False
 tag_sim: TagSimulator|None=None
 
-def save_roi(pts,path): 
+def save_roi(pts,path):
     with open(path,"w") as f:
         f.write(json.dumps({"points":pts}))
 
-def load_roi(path): 
+def load_roi(path):
     with open(path,"r") as f:
         data=json.load(f)
     return [tuple(p) for p in data["points"]]
 
-def in_poly(pt,poly): 
+def in_poly(pt,poly):
     return cv2.pointPolygonTest(np.array(poly,np.int32),pt,False)>=0
 
 def draw_poly(frame,poly,color,fill=True):
     pts=np.array(poly,np.int32)
     if fill:
-        ov=frame.copy(); 
+        ov=frame.copy()
         cv2.fillPoly(ov,[pts],color)
         frame[:]=cv2.addWeighted(ov,0.2,frame,0.8,0)
     cv2.polylines(frame,[pts],True,color,2)
@@ -325,17 +495,17 @@ def draw_poly(frame,poly,color,fill=True):
 def mouse_cb(ev,x,y,flags,param):
     global _clicked,_selecting, tag_sim
     if param=="roi":
-        if ev==cv2.EVENT_LBUTTONDOWN: 
+        if ev==cv2.EVENT_LBUTTONDOWN:
             _clicked.append((x,y)); _selecting=True
-        elif ev==cv2.EVENT_RBUTTONDOWN and _clicked: 
+        elif ev==cv2.EVENT_RBUTTONDOWN and _clicked:
             _clicked.pop()
-        elif ev==cv2.EVENT_MBUTTONDOWN: 
+        elif ev==cv2.EVENT_MBUTTONDOWN:
             _selecting=False
     else:
         if ev==cv2.EVENT_LBUTTONDOWN and tag_sim is not None:
             tag_sim.click(x,y)
 
-# ---------------- HUD extra: mini semáforos e indicadores ----------------
+# ---------------- HUD extra ----------------
 def draw_light_bulb(img, center, radius, on, color_on, color_off=(60,60,60), thick=-1):
     color = color_on if on else color_off
     cv2.circle(img, center, radius, (0,0,0), 2)
@@ -343,24 +513,20 @@ def draw_light_bulb(img, center, radius, on, color_on, color_off=(60,60,60), thi
 
 def draw_mini_traffic_lights(frame, outs: dict, origin_xy=(20, 20)):
     x, y = origin_xy
-    # Caixa carros (vertical: R, Y, G)
     box_w, box_h = 60, 160
     cv2.rectangle(frame, (x, y), (x+box_w, y+box_h), (40,40,40), -1)
     cv2.rectangle(frame, (x, y), (x+box_w, y+box_h), (200,200,200), 2)
-    # Lâmpadas carros
     cx = x + box_w//2
     r = 16
-    draw_light_bulb(frame, (cx, y+30), r, outs["veh_r"], (0,0,255))     # vermelho
-    draw_light_bulb(frame, (cx, y+80), r, outs["veh_y"], (0,255,255))   # amarelo
-    draw_light_bulb(frame, (cx, y+130), r, outs["veh_g"], (0,255,0))    # verde
+    draw_light_bulb(frame, (cx, y+30), r, outs["veh_r"], (0,0,255))
+    draw_light_bulb(frame, (cx, y+80), r, outs["veh_y"], (0,255,255))
+    draw_light_bulb(frame, (cx, y+130), r, outs["veh_g"], (0,255,0))
     cv2.putText(frame, "CARROS", (x-2, y+box_h+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1)
 
-    # Caixa pedestre (lado)
     x2 = x + box_w + 20
     box2_w, box2_h = 60, 100
     cv2.rectangle(frame, (x2, y), (x2+box2_w, y+box2_h), (40,40,40), -1)
     cv2.rectangle(frame, (x2, y), (x2+box2_w, y+box2_h), (200,200,200), 2)
-    # Lâmpadas pedestre: DON'T WALK (vermelho) em cima, WALK (verde) em baixo
     cx2 = x2 + box2_w//2
     draw_light_bulb(frame, (cx2, y+30), 16, outs["ped_dw"], (0,0,255))
     draw_light_bulb(frame, (cx2, y+70), 16, outs["ped_w"], (0,255,0))
@@ -380,7 +546,7 @@ def draw_preemption_indicators(frame, tag_ts, btn_ts, uid_text, show_secs=2.0, u
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,220,255), 2)
 
 # ===================== SERIAL COM ESP32 =====================
-SER_PORT = None  # ex.: "COM5" (Windows) ou "/dev/ttyUSB0" (Linux)
+SER_PORT = None  # "COM5" (Windows) ou "/dev/ttyUSB0" (Linux)
 SER_BAUD = 115200
 
 ser = None
@@ -435,7 +601,6 @@ def ser_send(line: str):
             print("[SER] erro envio:", e)
 
 def outputs_to_bits(outs: dict) -> str:
-    # Ordem: veh_g, veh_y, veh_r, ped_w, ped_dw
     return "".join([
         '1' if outs["veh_g"] else '0',
         '1' if outs["veh_y"] else '0',
@@ -452,17 +617,14 @@ def parse_args():
     p.add_argument("reset", nargs="?", default=None,
                    help="Digite 'reset' para apagar a ROI e redesenhar")
 
-    # presets de webcam
     p.add_argument("--480p", action="store_true", help="Força 640x480 @fps (padrão 30)")
     p.add_argument("--720p", action="store_true", help="Força 1280x720 @fps (padrão 30)")
     p.add_argument("--1080p", action="store_true", help="Força 1920x1080 @fps (padrão 30)")
 
-    # custom
     p.add_argument("--width", type=int, help="Largura da webcam")
     p.add_argument("--height", type=int, help="Altura da webcam")
     p.add_argument("--fps", type=int, default=30, help="FPS desejado (padrão 30)")
 
-    # porta serial opcional
     p.add_argument("--port", type=str, help="Porta serial do ESP32 (ex.: COM5, /dev/ttyUSB0)")
     return p.parse_args()
 
@@ -483,6 +645,13 @@ def main():
     if args.port:
         SER_PORT = args.port
 
+    # === Audio ===
+    audio = AudioManager()
+    audio.speak("Teste de voz. O sinal abrira em breve.")
+    time.sleep(3)
+    audio.speak("O sinal fechara em breve.")
+
+
     # === Serial com ESP ===
     serial_ok = serial_init()
     if not serial_ok:
@@ -490,18 +659,17 @@ def main():
 
     # === YOLO ===
     model=YOLO(YOLO_MODEL_PATH)
-    try: 
+    try:
         model.fuse()
-    except: 
+    except:
         pass
 
     # === Câmera ===
     cap=cv2.VideoCapture(CAMERA_URL)
     cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
 
-    # Se for webcam, aplique presets e custom
     is_webcam = isinstance(CAMERA_URL, int) or str(CAMERA_URL).isdigit()
-    if is_webcam:# >>> Resolução manual preferencial <<<
+    if is_webcam:
         if MANUAL_RES:
             if MANUAL_RES == 480:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -512,7 +680,6 @@ def main():
             elif MANUAL_RES == 1080:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            # Você pode acrescentar outros aqui
         if args.__dict__.get("480p"):
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -542,24 +709,22 @@ def main():
               int(cap.get(cv2.CAP_PROP_FPS)),
               "fps")
 
-    if not cap.isOpened(): 
-        print("Nao abriu camera"); 
+    if not cap.isOpened():
+        print("Nao abriu camera")
         return
 
     tag_sim=TagSimulator()
     fsm=TrafficLightFSM()
 
-    # Indicadores pré-empção no HUD
+    # Indicadores HUD
     last_tag_ts = None
     last_button_ts = None
     last_uid_text = None
-    INDICATOR_SHOW_SECS = 2.0
-    UID_SHOW_SECS = 3.0
 
     # ROI
     if os.path.exists(ROI_JSON):
         try:
-            roi=load_roi(ROI_JSON); 
+            roi=load_roi(ROI_JSON)
             print("ROI:",roi)
         except Exception as e:
             print("Falha ao ler ROI, redesenhando...", e)
@@ -568,14 +733,14 @@ def main():
         roi=None
 
     if roi is None:
-        cv2.namedWindow("Selecione ROI"); 
+        cv2.namedWindow("Selecione ROI")
         cv2.setMouseCallback("Selecione ROI",mouse_cb,param="roi")
         while True:
             for _ in range(2): cap.grab()
             ok,frame=cap.read()
             if not ok: break
             prev=frame.copy()
-            for p in _clicked: 
+            for p in _clicked:
                 cv2.circle(prev,p,4,(0,255,255),-1)
             if len(_clicked)>=2:
                 cv2.polylines(prev,[np.array(_clicked,np.int32)],False,(0,255,255),2)
@@ -584,38 +749,35 @@ def main():
             cv2.imshow("Selecione ROI",prev)
             key=cv2.waitKey(1)&0xFF
             if not _selecting and len(_clicked)>=3:
-                roi=_clicked.copy(); 
-                save_roi(roi,ROI_JSON); 
-                cv2.destroyWindow("Selecione ROI"); 
+                roi=_clicked.copy()
+                save_roi(roi,ROI_JSON)
+                cv2.destroyWindow("Selecione ROI")
                 break
-            if key==ord('q') or key==27: 
+            if key==ord('q') or key==27:
                 return
-    if roi is None: 
+    if roi is None:
         return
 
-    cv2.namedWindow(MAIN_WIN); 
+    cv2.namedWindow(MAIN_WIN)
     cv2.setMouseCallback(MAIN_WIN,mouse_cb,param=None)
 
-    # Parâmetros de inferência
     infer_scale = 0.75 if FAST else 1.0
     imgsz = 640
 
-    # Controle de envio para o ESP
     _last_bits = None
     _last_tx_ms = 0
 
     while True:
-        # === leitura de frame ===
         if FAST:
-            for _ in range(2): 
+            for _ in range(2):
                 cap.grab()
         ok,frame=cap.read()
-        if not ok: 
+        if not ok:
             break
 
         draw_poly(frame,roi,C_ROI,fill=True)
 
-        # === detecção apenas de pessoas ===
+        # detecção pessoas
         infer_frame = frame if infer_scale==1.0 else cv2.resize(
             frame, None, fx=infer_scale, fy=infer_scale, interpolation=cv2.INTER_LINEAR)
 
@@ -641,10 +803,10 @@ def main():
                 cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
                 cv2.circle(frame,(cx,cy),4,color,-1)
 
-                if inside: 
+                if inside:
                     pessoa_na_faixa=True
 
-        # === RECEBE eventos do ESP (TAG/HB/PONG/BTN) ===
+        # RX ESP (TAG/HB/PONG/BTN)
         try:
             while True:
                 line = rx_q.get_nowait()
@@ -663,35 +825,46 @@ def main():
         except queue.Empty:
             pass
 
-        # === TAG simulação local (opcional) ===
+        # TAG local
         tag_sim.file_poll()
         pulse, sim_id = tag_sim.poll()
-        if pulse: 
+        if pulse:
             fsm.request_tag()
             last_tag_ts = time.time()
             last_uid_text = f"SIM_{sim_id}" if sim_id is not None else "SIM"
 
-        # === FSM e HUD ===
-        fsm.update(pessoa_na_faixa)
+        # FSM
+        state, events = fsm.update(pessoa_na_faixa)
         fsm.overlay(frame, pessoa_na_faixa)
 
-        # Desenha o botão primeiro (fica por baixo)
-        tag_sim.draw_button(frame)
+        # ======= Gatilhos de ÁUDIO =======
+        for ev in events:
+            if ev == "veh_yel_blink_start":
+                # Pisca dos CARROS começou
+                audio.speak("O sinal ira abrir em breve")
+            elif ev == "ped_open_start":
+                # Pedestre abriu -> ligar buzzer
+                audio.buzzer(True)
+            elif ev == "ped_green_blink_start":
+                # Começou pisca do PEDESTRE (pré-fechamento)
+                audio.speak("O sinal fechara em breve")
+                audio.buzzer(False)  # silencia durante o pisca
+            elif ev == "ped_open_end":
+                # Garantir buzz OFF ao fechar
+                audio.buzzer(False)
 
-        # Centraliza o semáforo no meio da tela
+        # HUD extra
+        tag_sim.draw_button(frame)
         h, w = frame.shape[:2]
-        sem_w = 60 + 20 + 60   # largura: caixa carros (60) + gap (20) + caixa pedestre (60)
-        sem_h = 160            # altura da caixa de carros (a maior)
+        sem_w = 60 + 20 + 60
+        sem_h = 160
         ox = w//2 - sem_w//2
         oy = 20
         draw_mini_traffic_lights(frame, fsm.outputs, origin_xy=(ox, oy))
-
-        # Indicadores (texto) depois
         draw_preemption_indicators(frame, last_tag_ts, last_button_ts, last_uid_text,
-                                show_secs=2.0, uid_secs=3.0)
+                                   show_secs=2.0, uid_secs=3.0)
 
-
-        # === Envia saídas físicas ao ESP (quando mudam ou a cada 500ms) ===
+        # TX saídas físicas
         bits = outputs_to_bits(fsm.outputs)
         now_ms = int(time.time() * 1000)
         if serial_ok and (bits != _last_bits or (now_ms - _last_tx_ms) > 500):
@@ -699,15 +872,24 @@ def main():
             _last_bits = bits
             _last_tx_ms = now_ms
 
-        # === janela e teclado (ordem correta: imshow -> waitKey) ===
+        # janela/teclado
         cv2.imshow(MAIN_WIN,frame)
         key=cv2.waitKey(1)&0xFF
-        if key==ord('q') or key==27: 
+        if key==ord('q') or key==27:
             break
         tag_sim.keypress(key)
 
-    # === finalizar ===
-    cap.release(); 
+    # finalizar
+    try:
+        audio.buzzer(False)
+    except Exception:
+        pass
+    if ser and ser.is_open:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    cap.release()
     cv2.destroyAllWindows()
 
 if __name__=="__main__":

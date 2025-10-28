@@ -33,7 +33,7 @@ from ultralytics import YOLO
 YOLO_MODEL_PATH = "yolo11s.pt"
 
 # Webcam/stream
-DEFAULT_CAMERA = 1 #"video3.mp4"  # índice ou URL (RTSP/HTTP)
+DEFAULT_CAMERA = 0 #"video3.mp4"  # índice ou URL (RTSP/HTTP)
 
 # ROI (duas zonas)
 ROI_JSON = "roi_2zones.json"  # {"zoneA":[(x,y),...], "zoneB":[(x,y),...]}
@@ -119,8 +119,8 @@ class Phase(Enum):
     NS_GREEN=1
     NS_YEL=2
     ALL_RED=3
-    EW_GREEN=4
-    EW_YEL=5
+    LO_GREEN=4
+    LO_YEL=5
 
 # Tempos (s) — ajuste para maquete
 MIN_GREEN = 5           # verde mínimo antes de troca
@@ -136,7 +136,7 @@ class TwoZoneController:
         self.phase = Phase.NS_GREEN
         self.t0 = time.monotonic()
         self.tgt = BASE_GREEN
-        self.outputs = dict(ns_g=True, ns_y=False, ns_r=False, ew_g=False, ew_y=False, ew_r=True)
+        self.outputs = dict(ns_g=True, ns_y=False, ns_r=False, lo_g=False, lo_y=False, lo_r=True)
         self._last_green_ns = True  # para desempate alternando
 
     def _reset(self, dur):
@@ -149,18 +149,18 @@ class TwoZoneController:
     def remaining(self):
         return max(0.0, self.tgt - self._elapsed())
 
-    def _outs(self, ns_g, ns_y, ns_r, ew_g, ew_y, ew_r):
-        self.outputs = dict(ns_g=ns_g, ns_y=ns_y, ns_r=ns_r, ew_g=ew_g, ew_y=ew_y, ew_r=ew_r)
+    def _outs(self, ns_g, ns_y, ns_r, lo_g, lo_y, lo_r):
+        self.outputs = dict(ns_g=ns_g, ns_y=ns_y, ns_r=ns_r, lo_g=lo_g, lo_y=lo_y, lo_r=lo_r)
 
-    def update(self, count_ns: int, count_ew: int):
+    def update(self, count_ns: int, count_lo: int):
         """Atualiza FSM usando contagens. Retorna a fase atual."""
         # NS GREEN
         if self.phase == Phase.NS_GREEN:
             self._outs(True, False, False, False, False, True)
             # terminou alvo atual?
             if self._elapsed() >= self.tgt:
-                # Extende se NS tem >= EW e há veículos (evita starvation do lado com mais fila)
-                if count_ns > 0 and (count_ns >= count_ew) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
+                # Extende se NS tem >= lo e há veículos (evita starvation do lado com mais fila)
+                if count_ns > 0 and (count_ns >= count_lo) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
                     self.tgt += GREEN_EXT_STEP
                 else:
                     self.phase = Phase.NS_YEL
@@ -179,34 +179,34 @@ class TwoZoneController:
             self._outs(False, False, True, False, False, True)
             if self._elapsed() >= self.tgt:
                 # Escolha por contagem
-                if (count_ns > 0 or count_ew > 0) and (count_ns != count_ew):
-                    if count_ns > count_ew:
+                if (count_ns > 0 or count_lo > 0) and (count_ns != count_lo):
+                    if count_ns > count_lo:
                         self.phase = Phase.NS_GREEN
                     else:
-                        self.phase = Phase.EW_GREEN
+                        self.phase = Phase.LO_GREEN
                     self._reset(max(MIN_GREEN, BASE_GREEN))
                 else:
                     # Sem demanda ou empate: alterna
                     if self._last_green_ns:
-                        self.phase = Phase.EW_GREEN
+                        self.phase = Phase.LO_GREEN
                     else:
                         self.phase = Phase.NS_GREEN
                     self._reset(MIN_GREEN)
 
-        # EW GREEN
-        elif self.phase == Phase.EW_GREEN:
+        # LO GREEN
+        elif self.phase == Phase.LO_GREEN:
             self._outs(False, False, True, True, False, False)
             if self._elapsed() >= self.tgt:
-                # Extende se EW tem >= NS e há veículos
-                if count_ew > 0 and (count_ew >= count_ns) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
+                # Extende se LO tem >= NS e há veículos
+                if count_lo > 0 and (count_lo >= count_ns) and (self.tgt + GREEN_EXT_STEP <= GREEN_MAX):
                     self.tgt += GREEN_EXT_STEP
                 else:
-                    self.phase = Phase.EW_YEL
+                    self.phase = Phase.LO_YEL
                     self._reset(YEL_TIME)
                     self._last_green_ns = False
 
-        # EW YELLOW
-        elif self.phase == Phase.EW_YEL:
+        # LO YELLOW
+        elif self.phase == Phase.LO_YEL:
             self._outs(False, False, True, False, True, False)
             if self._elapsed() >= self.tgt:
                 self.phase = Phase.ALL_RED
@@ -214,7 +214,7 @@ class TwoZoneController:
 
         return self.phase
 
-    def overlay(self, frame, count_ns, count_ew):
+    def overlay(self, frame, count_ns, count_lo):
         def put_right(y, text, scale=0.85, color=(255,255,255), th=2):
             (w,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, th)
             x = frame.shape[1] - 20 - w
@@ -225,20 +225,20 @@ class TwoZoneController:
             Phase.NS_GREEN: "NS: VERDE",
             Phase.NS_YEL:   "NS: AMARELO",
             Phase.ALL_RED:  "ALL RED",
-            Phase.EW_GREEN: "EW: VERDE",
-            Phase.EW_YEL:   "EW: AMARELO",
+            Phase.LO_GREEN: "LO: VERDE",
+            Phase.LO_YEL:   "LO: AMARELO",
         }[self.phase]
 
         # Prioridade textual (quem tem mais veículos)
-        priority = "NS" if count_ns > count_ew else ("EW" if count_ew > count_ns else "EMPATE")
+        priority = "NS" if count_ns > count_lo else ("LO" if count_lo > count_ns else "EMPATE")
 
         put_right(40, f"{phase_name} | T-{int(round(self.remaining()))}s")
         put_right(70,  f"Veiculos Zona A (NS): {count_ns}", 0.8, (200,255,200))
-        put_right(95,  f"Veiculos Zona B (EW): {count_ew}", 0.8, (200,255,200))
+        put_right(95,  f"Veiculos Zona B (LO): {count_lo}", 0.8, (200,255,200))
         put_right(120, f"Prioridade (maior fila): {priority}", 0.8, (255,230,180))
 
 def draw_traffic_lights(frame, outs):
-    # blocos NS e EW no canto superior esquerdo
+    # blocos NS e LO no canto superior esquerdo
     def draw_light(x, y, on_r, on_y, on_g, label):
         cv2.putText(frame, label, (x-5, y-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30,30,30), 2)
@@ -251,7 +251,7 @@ def draw_traffic_lights(frame, outs):
         cv2.rectangle(frame, (x-18, y-18), (x+18, y+68), (80,80,80), 2)
 
     draw_light(40, 40,  outs["ns_r"], outs["ns_y"], outs["ns_g"], "NS")
-    draw_light(100, 40, outs["ew_r"], outs["ew_y"], outs["ew_g"], "EW")
+    draw_light(100, 40, outs["lo_r"], outs["lo_y"], outs["lo_g"], "LO")
 
 
 # ===================== MAIN =====================
@@ -368,7 +368,7 @@ def main():
     if zoneA is None or zoneB is None:
         zoneA = acquire_zone("Defina Zona A (ex.: NS)")
         if zoneA is None: return
-        zoneB = acquire_zone("Defina Zona B (ex.: EW)")
+        zoneB = acquire_zone("Defina Zona B (ex.: LO)")
         if zoneB is None: return
         save_rois(zoneA, zoneB, ROI_JSON)
 
@@ -483,9 +483,9 @@ def main():
         draw_traffic_lights(frame, ctl.outputs)
 
         # Legenda rápida
-        cv2.putText(frame, "Zona A = NS | Zona B = EW | (Sem ArUco / Emergencia)", 
+        cv2.putText(frame, "Zona A = NS | Zona B = LO | (Sem ArUco / Emergencia)", 
                     (20, frame.shape[0]-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30,30,30), 2)
-        cv2.putText(frame, "Zona A = NS | Zona B = EW | (Sem ArUco / Emergencia)", 
+        cv2.putText(frame, "Zona A = NS | Zona B = LO | (Sem ArUco / Emergencia)", 
                     (20, frame.shape[0]-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240,240,240), 1)
 
         # === janela/teclado ===
